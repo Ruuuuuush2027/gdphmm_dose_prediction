@@ -11,7 +11,6 @@ import json
 
 from scipy import ndimage
 from os.path import join
-from RcToolBox.basic_op import hprint
 from monai.transforms import (
     Compose,
     Resized,
@@ -21,10 +20,6 @@ from monai.transforms import (
     SpatialCropd,
     RandSpatialCropd,
 )
-
-
-
-
 
 def tr_augmentation_v1(KEYS, in_size, out_size, crop_center):
 
@@ -163,6 +158,7 @@ class GDPDataset_v2(Dataset):
         
         self.phase = phase
         self.data_list = df["npz_path"].tolist()
+
         self.site_list = df["site"].tolist()
         self.cohort_list = df["cohort"].tolist()
 
@@ -183,9 +179,7 @@ class GDPDataset_v2(Dataset):
 
         current_data_path = join(
             os.environ["Dataset"],
-            "GDP",
-            "train_v1",
-            data_path.split(os.sep)[-1],
+            data_path,
         )
 
         # *############################# img and dose  #############################
@@ -230,14 +224,18 @@ class GDPDataset_v2(Dataset):
             print(" **************** angle_plate error in ", data_path)
             In_dict["angle_plate"] = np.ones(In_dict["img"][0].shape)
 
-        D3_plate = np.repeat(
-            In_dict["angle_plate"][np.newaxis, :, :], z_end - z_begin, axis=0
-        )
+        if In_dict["angle_plate"].ndim == 2:
+            D3_plate = np.repeat(
+                In_dict["angle_plate"][np.newaxis, :, :], max(1, z_end - z_begin), axis=0
+            )
+        else:
+            D3_plate = In_dict["angle_plate"][z_begin:z_end]
 
         if (
             D3_plate.shape[1] != angle_plate_3D.shape[1]
             or D3_plate.shape[2] != angle_plate_3D.shape[2]
         ):
+            # breakpoint()
             D3_plate = ndimage.zoom(
                 D3_plate,
                 (
@@ -252,10 +250,6 @@ class GDPDataset_v2(Dataset):
         In_dict["angle_plate"] = angle_plate_3D
         In_dict["comb_optptv"] = In_dict["comb_optptv"] / self.cfig["dose_div_factor"]
         In_dict["comb_ptv"] = In_dict["comb_ptv"] / self.cfig["dose_div_factor"]
-
-        # *############################# debug 1#############################
-
-      
 
         # *############################# augmentation  #############################
         AUG_KEYS = [

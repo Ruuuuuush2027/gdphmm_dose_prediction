@@ -1,6 +1,7 @@
 import torch
 import lightning as L
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from dataloading.efficient_data_loader_v2 import GDPDataset_v2
 from evaluation.dose_metric_online import dose_MAE_metric, cropped2ori
@@ -29,7 +30,7 @@ class L_Trainer(object):
         self.fabric = L.Fabric(
             accelerator="gpu",
             strategy="auto",
-            devices=1,
+            devices=self.devices,
             num_nodes=1,
             precision=self.precision,
         )
@@ -61,13 +62,17 @@ class L_Trainer(object):
         assert len(optimizer) == 2
         assert len(lr_scheduler) == 2
 
-        self.train_HaN_loader = self.fabric.setup_dataloaders(train_loader[0])
-        self.train_Lung_loader = self.fabric.setup_dataloaders(train_loader[1])
+        self.train_HaN_loader = self.fabric.setup_dataloaders(
+            train_loader[0], move_to_device=True
+        )
+        self.train_Lung_loader = self.fabric.setup_dataloaders(
+            train_loader[1], move_to_device=True
+        )
         self.val_HaN_loader = self.fabric.setup_dataloaders(
-            val_loader[0], use_distributed_sampler=False
+            val_loader[0], move_to_device=True, use_distributed_sampler=False
         )
         self.val_Lung_loader = self.fabric.setup_dataloaders(
-            val_loader[1], use_distributed_sampler=False
+            val_loader[1], move_to_device=True, use_distributed_sampler=False
         )
 
         self.HaN_optimizer = optimizer[0]
@@ -85,6 +90,13 @@ class L_Trainer(object):
         self.model, self.HaN_optimizer, self.Lung_optimizer = self.fabric.setup(
             model, self.HaN_optimizer, self.Lung_optimizer
         )
+        if self.cfig.get("torch_compile", False):
+            print("Compiling model with torch.compile()...")
+            if hasattr(self.model, "module"):
+                # model.module is DDP/FSDP wrapped inner model
+                self.model.module = torch.compile(self.model.module)
+            else:
+                self.model = torch.compile(self.model)
         self.criterion = criterion
 
         for i in range(self.current_epoch, self.max_epoch):
@@ -92,8 +104,12 @@ class L_Trainer(object):
             self.val_loop()
 
     def save_best_checkpoint(self, path):
+        # Save state_dicts: more portable and re-compile on load if needed.
+        module = self.model.module if hasattr(self.model, "module") else self.model
         state = {
-            "model": self.model,
+            "model_state_dict": module.state_dict(),
+            "HaN_optimizer_state": self.HaN_optimizer.state_dict(),
+            "Lung_optimizer_state": self.Lung_optimizer.state_dict(),
             "epoch": self.current_epoch,
         }
         self.fabric.save(path, state)
@@ -105,7 +121,7 @@ class L_Trainer(object):
         HaN_iter = iter(self.train_HaN_loader)
         Lung_iter = iter(self.train_Lung_loader)
 
-        for step in range(epoch_total_steps):
+        for step in tqdm(range(epoch_total_steps), desc=f"Epoch {self.current_epoch}"):
             if step % 2 == 0:
                 try:
                     batch_data = next(HaN_iter)
@@ -113,11 +129,12 @@ class L_Trainer(object):
                     HaN_iter = iter(self.train_HaN_loader)
                     batch_data = next(HaN_iter)
 
-                outputs = self.model(batch_data["data"], task="HaN")
-                if self.cfig["act_sig"]:
-                    outputs = torch.sigmoid(outputs)
-                outputs = outputs * self.cfig["scale_out"]
-                loss = self.criterion(outputs, batch_data["label"])
+                with self.fabric.autocast():
+                    outputs = self.model(batch_data["data"], task="HaN")
+                    if self.cfig["act_sig"]:
+                        outputs = torch.sigmoid(outputs)
+                    outputs = outputs * self.cfig["scale_out"]
+                    loss = self.criterion(outputs, batch_data["label"])
                 self.HaN_optimizer.zero_grad()
                 self.fabric.backward(loss)
                 self.HaN_optimizer.step()
@@ -130,11 +147,12 @@ class L_Trainer(object):
                     Lung_iter = iter(self.train_Lung_loader)
                     batch_data = next(Lung_iter)
 
-                outputs = self.model(batch_data["data"], task="Lung")
-                if self.cfig["act_sig"]:
-                    outputs = torch.sigmoid(outputs)
-                outputs = outputs * self.cfig["scale_out"]
-                loss = self.criterion(outputs, batch_data["label"])
+                with self.fabric.autocast():
+                    outputs = self.model(batch_data["data"], task="Lung")
+                    if self.cfig["act_sig"]:
+                        outputs = torch.sigmoid(outputs)
+                    outputs = outputs * self.cfig["scale_out"]
+                    loss = self.criterion(outputs, batch_data["label"])
                 self.Lung_optimizer.zero_grad()
                 self.fabric.backward(loss)
                 self.Lung_optimizer.step()
@@ -142,6 +160,8 @@ class L_Trainer(object):
                     self.Lung_lr_scheduler.step()
 
             train_loss.append(loss.item())
+            if (step + 1) % 20 == 0:
+                torch.cuda.empty_cache()
 
         self.current_epoch += 1
         print(f"Epoch: {self.current_epoch}, tr_loss: {np.mean(train_loss):.4f}")
@@ -162,6 +182,7 @@ class L_Trainer(object):
         dose_score_list = []
         Lung_score_list = []
         HaN_score_list = []
+        step = 0
 
         with torch.no_grad():
             for batch_data in self.val_Lung_loader:
@@ -189,6 +210,9 @@ class L_Trainer(object):
                     )
                     dose_score_list.append(score)
                     Lung_score_list.append(score)
+                step += 1
+                if step % 20 == 0:
+                    torch.cuda.empty_cache()
 
             for batch_data in self.val_HaN_loader:
                 outputs = self.model(batch_data["data"], task="HaN")
@@ -215,6 +239,9 @@ class L_Trainer(object):
                     )
                     dose_score_list.append(score)
                     HaN_score_list.append(score)
+                step += 1
+                if step % 20 == 0:
+                    torch.cuda.empty_cache()
 
         mean_dose_score = np.mean(dose_score_list)
         mean_Lung_score = np.mean(Lung_score_list)
@@ -257,13 +284,13 @@ if __name__ == "__main__":
     parser.add_argument("--fp", type=str, default="32")
     args = parser.parse_args()
 
-    exp_name = args.c.split(".yaml")[0]
+    exp_name = args.c.split(".yaml")[0] + "/" + args.project
     print("exp_name", exp_name)
     cfig = yaml.load(open(join("config_files", args.c)), Loader=yaml.FullLoader)
 
 
     save_checkpoint_folder = os.path.join(
-        os.environ.get("Result", "./results"), "GDP", "MODEL", exp_name
+        os.environ.get("Result", "./results"), exp_name
     )
     print("save_checkpoint_folder", save_checkpoint_folder)
 

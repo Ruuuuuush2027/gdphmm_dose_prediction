@@ -125,7 +125,7 @@ if __name__ == "__main__":
 
   
     model.load_state_dict(
-        torch.load(model_pth, map_location=device, weights_only=True)["model"]
+        torch.load(model_pth, map_location=device, weights_only=True)["model_state_dict"]
     )
     model.to(device)
     model.eval()

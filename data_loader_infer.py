@@ -125,6 +125,7 @@ class MyDataset(Dataset):
         if len(str(PatientID)) < 3:
             PatientID = f"{PatientID:0>3}"
 
+        data_path = os.path.join('datasets', data_path)
         data_npz = np.load(data_path, allow_pickle=True)
         In_dict = dict(data_npz)["arr_0"].item()
 
@@ -298,7 +299,16 @@ class GetLoader(object):
     def __init__(self, cfig):
         super().__init__()
         self.cfig = cfig
-
+    
+    def train_dataloader(self):
+        dataset = MyDataset(self.cfig, phase="train")
+        return DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
 
     def val_dataloader(self):
         dataset = MyDataset(self.cfig, phase="valid")
@@ -337,14 +347,9 @@ if __name__ == "__main__":
     }
 
     loaders = GetLoader(cfig)
-    val_loader = loaders.val_dataloader()
-    test_loader = loaders.test_dataloader()
-    print(len(val_loader), len(test_loader))
+    train_loader = loaders.train_dataloader()
     
-    # for i, data in enumerate(val_loader):
-    #     print(
-    #         data["data"].shape,
-    #         data["label"].shape,
-    #         data["site"],
-    #     )
-    #     break
+    for i, data in enumerate(train_loader):
+        for j, k in data.items():
+            print(j, k.shape)
+        break

@@ -6,7 +6,7 @@ loader_params:
     scale_dose_dict: 'meta_files/PTV_DICT.json'
     pat_obj_dict: 'meta_files/Pat_Obj_DICT.json'
     num_workers: 8
-    prefetch_factor : 2
+    prefetch_factor : 8
 
     down_HU: -1000
     up_HU: 1000
@@ -32,3 +32,4 @@ scale_out: 7.5
 
 save_model_path: best_model.pth
 save_pred_path: results
+torch_compile: true
